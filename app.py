@@ -1,13 +1,12 @@
 """Agentic Research Workflow: Planner -> Researcher -> Writer -> Editor -> Revision.
-Run:  pip install streamlit anthropic requests
-      export ANTHROPIC_API_KEY=sk-...   (optional: TAVILY_API_KEY)
+Run:  pip install streamlit openai requests
+      export LLM_API_KEY=...   (optional: TAVILY_API_KEY)
       streamlit run app.py
 """
 import json, os, re, time, xml.etree.ElementTree as ET
 import requests, streamlit as st
-from anthropic import Anthropic
+from openai import OpenAI
 
-MODEL = "claude-sonnet-5-5"
 st.set_page_config(page_title="Agentic Research Lab", page_icon="🧠", layout="wide")
 st.markdown("""<style>
 .block-container{padding-top:2rem}
@@ -19,9 +18,9 @@ st.markdown("""<style>
 
 # ---------- LLM helper ----------
 def llm(client, system, prompt, max_tokens=2000):
-    r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system,
-                               messages=[{"role": "user", "content": prompt}])
-    return r.content[0].text
+    r = client.chat.completions.create(model=MODEL, max_tokens=max_tokens, messages=[
+        {"role": "system", "content": system}, {"role": "user", "content": prompt}])
+    return r.choices[0].message.content
 
 # ---------- Research tools ----------
 def wikipedia(q):
@@ -59,7 +58,12 @@ def tavily(q, key):
 # ---------- Sidebar ----------
 with st.sidebar:
     st.title("⚙️ Settings")
-    akey = st.text_input("Anthropic API key", os.getenv("ANTHROPIC_API_KEY", ""), type="password")
+    PROVIDERS = {"OpenRouter (free Kimi)": ("https://openrouter.ai/api/v1", "moonshotai/kimi-k2.6:free"),
+                 "Moonshot (paid, $1 min)": ("https://api.moonshot.ai/v1", "kimi-k2.6")}
+    prov = st.selectbox("Provider", list(PROVIDERS))
+    BASE_URL = PROVIDERS[prov][0]
+    MODEL = st.text_input("Model", PROVIDERS[prov][1])
+    akey = st.text_input("API key", os.getenv("LLM_API_KEY", ""), type="password")
     tkey = st.text_input("Tavily API key (optional)", os.getenv("TAVILY_API_KEY", ""), type="password")
     st.markdown("---")
     st.markdown("**Pipeline**\n1. 🗂 Planner\n2. 🔎 Researcher\n3. ✍️ Writer\n4. 🧐 Editor\n5. ✅ Revision")
@@ -70,7 +74,7 @@ topic = st.text_input("Research topic", "How do multi-agent LLM systems improve 
 go = st.button("🚀 Run workflow", type="primary", disabled=not (akey and topic))
 
 if go:
-    client = Anthropic(api_key=akey)
+    client = OpenAI(api_key=akey, base_url=BASE_URL)
     t0, S = time.time(), st.session_state
     prog = st.progress(0, "Starting…")
 
