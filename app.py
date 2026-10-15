@@ -39,16 +39,19 @@ st.markdown("""<style>
 
 # ---------- LLM helper ----------
 def llm(client, system, prompt, max_tokens=2000):
-    """Chat call with retries for transient errors (free models are often busy)."""
-    last = None
+    """Chat call with retries. Free reasoning models can spend the whole token budget thinking and
+    return an empty reply, so each empty reply retries with a larger budget."""
+    last, budget = None, max_tokens
     for attempt in range(3):
         try:
-            r = client.chat.completions.create(model=MODEL, max_tokens=max_tokens, messages=[
+            r = client.chat.completions.create(model=MODEL, max_tokens=budget, messages=[
                 {"role": "system", "content": system}, {"role": "user", "content": prompt}])
-            text = r.choices[0].message.content
-            if text:
+            choice = r.choices[0]
+            text = choice.message.content
+            if text and text.strip():
                 return text
-            last = RuntimeError("The model returned an empty reply")
+            last = RuntimeError("The model returned an empty reply (finish reason: " + str(choice.finish_reason) + ")")
+            budget = min(budget * 2, 8000)
         except (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError) as e:
             last = e
         time.sleep(3 * (attempt + 1))
@@ -351,14 +354,16 @@ Write a one-page POV of 350 to 450 words in markdown with exactly these parts:
 
 Rules: use only facts that appear in the ledger. Never invent numbers, dates or quotes.
 Copy numbers exactly as written in the quote. If the ledger lacks data on something, say so
-under Watch-outs. Do not write a sources list.""", 2500)
+under Watch-outs. Do not write a sources list.""", 4000)
             s.update(label="Writer: draft complete", state="complete")
         prog.progress(78, "Editing...")
 
+        feedback, final = "", draft
         with st.status("Editor Agent: reviewing against the evidence...", expanded=False) as s:
-            feedback = llm(client, "You are a critical editor of strategy briefs. Give 4-5 specific, actionable "
-                                   "suggestions as a bullet list.",
-                           f"""Review this one-pager against its evidence ledger.
+            try:
+                feedback = llm(client, "You are a critical editor of strategy briefs. Give 4-5 specific, actionable "
+                                       "suggestions as a bullet list.",
+                               f"""Review this one-pager against its evidence ledger.
 Check: is every number or claim supported by the evidence item it cites, is the POV a clear
 position, is the 'so what' useful to a marketer, and is it under 450 words.
 
@@ -366,12 +371,22 @@ One-pager:
 {draft}
 
 Evidence ledger:
-{facts}""")
-            s.update(label="Editor Agent: feedback ready", state="complete")
+{facts}""", 2500)
+                s.update(label="Editor Agent: feedback ready", state="complete")
+            except (AuthenticationError, NotFoundError):
+                raise
+            except Exception as e:
+                ERRORS.append(f"Editor skipped ({type(e).__name__})")
+                feedback = "The editor step did not return a reply this run."
+                s.update(label="Editor Agent: skipped, the model returned no reply", state="error")
 
         with st.status("Revising with feedback...", expanded=False) as s:
-            final = llm(client, "Revise the one-pager applying every suggestion. Output markdown only.",
-                        f"""Keep the same four parts, keep it between 350 and 450 words, keep the evidence tags like [E4],
+            if ERRORS and any(x.startswith("Editor skipped") for x in ERRORS):
+                s.update(label="Revision skipped: no editor feedback, showing the draft", state="error")
+            else:
+                try:
+                    final = llm(client, "Revise the one-pager applying every suggestion. Output markdown only.",
+                                f"""Keep the same four parts, keep it between 350 and 450 words, keep the evidence tags like [E4],
 copy numbers exactly as written in the ledger, and remove any claim the ledger does not support.
 Do not add a sources list.
 
@@ -382,8 +397,13 @@ Suggestions:
 {feedback}
 
 Evidence ledger:
-{facts}""", 2500)
-            s.update(label="Revision complete", state="complete")
+{facts}""", 4000)
+                    s.update(label="Revision complete", state="complete")
+                except (AuthenticationError, NotFoundError):
+                    raise
+                except Exception as e:
+                    ERRORS.append(f"Revision skipped ({type(e).__name__})")
+                    s.update(label="Revision skipped: the model returned no reply, showing the draft", state="error")
         prog.progress(100, "Done")
         S.result = dict(errors=sorted(set(ERRORS)), plan=plan, notes=notes, ledger=ledger, draft=draft,
                         feedback=feedback, final=final, secs=round(time.time() - t0, 1))
@@ -430,7 +450,7 @@ if "result" in st.session_state:
     with t[1]:
         st.markdown('<div class="agent a2">Research Agent</div>', unsafe_allow_html=True)
         if R.get("errors"):
-            st.caption("Some tools were unavailable this run: " + ", ".join(R["errors"]))
+            st.caption("Notes from this run: " + ", ".join(R["errors"]))
         for i, n in enumerate(R["notes"], 1):
             with st.expander(f"[{i}] {n['source']} - {n['title']}"):
                 st.write(n["text"])
