@@ -187,56 +187,73 @@ def fact_check(final, ledger):
     return rows
 
 
+def candidate_quotes(topic, text):
+    """Pick up to 3 data-bearing sentences from a source. Copied by code, so they are verbatim by construction."""
+    words = [w for w in norm(topic).split() if len(w) > 3]
+    sents = [x.strip() for x in re.split(r"(?<=[.!?]) +", text.replace(NL, " ")) if 40 <= len(x.strip()) <= 400]
+    scored = []
+    for idx, x in enumerate(sents):
+        nx = norm(x)
+        score = ((2 if any(ch.isdigit() for ch in x) else 0) + (1 if ("%" in x or "$" in x) else 0)
+                 + sum(1 for w in words if w in nx.split()))
+        scored.append((score, idx, x))
+    top = [t for t in sorted(scored, key=lambda t: (-t[0], t[1])) if t[0] >= 2][:3]
+    if not top:
+        top = [t for t in sorted(scored, key=lambda t: (-t[0], t[1])) if t[0] >= 1][:1]
+    return [t[2] for t in sorted(top, key=lambda t: t[1])]
+
+
 def extract_evidence(client, topic, angle, notes):
-    """Analysis stage: pull quotes, links and insights from the sources, then verify each quote."""
-    ledger, batch_size = [], 5
-    for start in range(0, len(notes), batch_size):
-        batch = notes[start:start + batch_size]
-        block = (NL * 2).join(f"Source {start + k}: {n['title']} ({n['source']})" + NL + n["text"]
-                              for k, n in enumerate(batch, 1))
-        prompt = f"""Topic: {topic}
+    """Analysis stage. Code copies the quotes word for word from each source, the model only writes
+    the insight for each one (and can mark a quote SKIP when it is not relevant)."""
+    items, seen_q = [], set()
+    for sid, n in enumerate(notes, 1):
+        for q in candidate_quotes(topic, n["text"]):
+            if norm(q) in seen_q:
+                continue
+            seen_q.add(norm(q))
+            items.append({"id": len(items) + 1, "source_id": sid, "quote": q, "insight": "",
+                          "kind": "data" if any(ch.isdigit() for ch in q) else "context",
+                          "verified": quote_in_source(q, n["text"]), "skip": False,
+                          "source": n["source"], "title": n["title"], "url": n["url"]})
+    items = items[:30]
+    for start in range(0, len(items), 10):
+        chunk = items[start:start + 10]
+        lines = NL.join(f"E{e['id']}: {e['quote']} (source: {e['source']})" for e in chunk)
+        try:
+            raw = llm(client, "You are a data analyst. Follow the reply format exactly.",
+                      f"""Topic: {topic}
 Question the POV must answer: {angle}
 
-Below are numbered sources. For each source, extract up to 3 evidence items that help answer the question.
-Prefer concrete data: percentages, counts, dollar amounts, dates, survey results, named findings.
-Each item has these keys:
-"source_id": the source number
-"quote": a sentence or fragment copied word for word from that source text, at most 40 words.
-Do not paraphrase or fix wording inside the quote.
-"insight": one sentence on what this evidence means for the question
-"kind": "data" if the quote contains a number or a measured result, otherwise "context"
-Skip a source that has nothing relevant. Reply with a JSON list only.
+For each numbered quote below, write one sentence (max 30 words) saying what it means for the question.
+If a quote is not relevant to the question, write SKIP instead of an insight.
+Reply with one line per quote in the form E3: insight. No other text.
 
-Sources:
-{block}"""
-        items = None
-        for attempt in range(2):
-            raw = llm(client, "You are a data analyst who extracts verifiable evidence. Reply with a JSON list only.",
-                      prompt, 2500)
-            try:
-                items = json.loads(raw[raw.find("["):raw.rfind("]") + 1])
-                break
-            except Exception:
-                items = None
-        if items is None:
-            ERRORS.append(f"Analysis batch {start // batch_size + 1} (bad JSON)")
+Quotes:
+{lines}""", 1500)
+        except (AuthenticationError, NotFoundError):
+            raise
+        except Exception as e:
+            ERRORS.append(f"Insights ({type(e).__name__})")
             continue
-        per_source = {}
-        for it in items:
-            try:
-                sid, quote = int(it["source_id"]), str(it["quote"]).strip()
-            except Exception:
+        by_id = {e["id"]: e for e in chunk}
+        for line in raw.split(NL):
+            line = line.strip().lstrip("-*0123456789. ").strip()
+            if line[:1] not in ("E", "e") or ":" not in line:
                 continue
-            if not (start < sid <= start + len(batch)) or not quote or per_source.get(sid, 0) >= 3:
-                continue
-            per_source[sid] = per_source.get(sid, 0) + 1
-            n = notes[sid - 1]
-            ledger.append({"id": len(ledger) + 1, "source_id": sid, "quote": quote,
-                           "insight": str(it.get("insight", "")).strip(),
-                           "kind": "data" if str(it.get("kind", "")).lower() == "data" else "context",
-                           "verified": quote_in_source(quote, n["text"]),
-                           "source": n["source"], "title": n["title"], "url": n["url"]})
-    return ledger[:36]
+            head, tail = line.split(":", 1)
+            head = head.strip()[1:]
+            if head.isdigit() and int(head) in by_id:
+                tail = tail.strip().strip("*").strip()
+                if tail.upper().startswith("SKIP"):
+                    by_id[int(head)]["skip"] = True
+                else:
+                    by_id[int(head)]["insight"] = tail
+    kept = [e for e in items if not e["skip"]] or items
+    for i, e in enumerate(kept, 1):
+        e["id"] = i
+        e["insight"] = e["insight"] or "(no insight returned by the model)"
+    return kept
 
 
 # ---------- Sidebar ----------
@@ -302,14 +319,14 @@ Keep any place named in the topic inside every query.""")
             raise RuntimeError("No sources were found. Add a free Tavily key in the sidebar and run again.")
         prog.progress(35, "Analysing...")
 
-        with st.status("Analysis Agent: extracting quotes, links and insights...", expanded=False) as s:
+        with st.status("Analysis Agent: pulling quotes and writing insights...", expanded=False) as s:
             ledger = extract_evidence(client, topic, plan["angle"], notes)
             good = [e for e in ledger if e["verified"]]
             s.update(label=f"Analysis Agent: {len(good)} of {len(ledger)} quotes verified in their sources",
                      state="complete")
         if len(good) < 3:
-            raise RuntimeError("Fewer than 3 quotes could be verified against their sources. "
-                               "Run again, add a Tavily key, or try another :free model.")
+            raise RuntimeError(f"Only {len(good)} usable quotes were found in {len(notes)} sources. "
+                               "Try a more specific topic, add a Tavily key, or run again.")
         prog.progress(60, "Writing...")
         facts = NL.join(f"[E{e['id']}] {Q}{e['quote']}{Q} ({e['source']}) | Insight: {e['insight']}" for e in good)
 
@@ -420,7 +437,7 @@ if "result" in st.session_state:
                 st.markdown(f"[Open source]({n['url']})")
     with t[2]:
         st.markdown('<div class="agent a1">Analysis Agent: evidence ledger</div>', unsafe_allow_html=True)
-        st.caption("Each quote was checked against its source text by code. Only verified quotes feed the one-pager.")
+        st.caption("Quotes are copied by code, word for word, from the source text and re-checked against it. The AI only writes the insight.")
         for e in ledger:
             flag = "Verified in source" if e["verified"] else "NOT found word for word, excluded"
             st.markdown(f"**E{e['id']}** | {e['kind']} | {flag} | {e['source']}")
