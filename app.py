@@ -1,16 +1,17 @@
-"""One-Page POV Agent: Planner -> Researcher -> Writer -> Editor -> Revision.
-Type a topic, get a one-page point of view built from marketing, consumer and polling sources.
+"""One-Page POV Agent: Planner -> Researcher -> Analyst -> Writer -> Editor -> Revision.
+Type a topic, get an evidence ledger (quotes + links + insights) and a one-page POV built only from it.
 Run:  pip install streamlit openai requests ddgs
       export LLM_API_KEY=...   (recommended: TAVILY_API_KEY)
       streamlit run app.py
 """
-import json, os, time
+import csv, io, json, os, re, time
 from urllib.parse import urlparse
 import requests, streamlit as st
 from openai import (OpenAI, AuthenticationError, NotFoundError, RateLimitError,
                     APIConnectionError, APITimeoutError, InternalServerError)
 
 NL = chr(10)
+Q = chr(34)
 HEADERS = {"User-Agent": "AgenticResearchLab/1.0 (https://github.com/arjha10-max/Agentic-Research-Lab)"}
 ERRORS = []
 
@@ -69,7 +70,7 @@ def wikipedia(q):
             headers=HEADERS, timeout=15)
         resp.raise_for_status()
         pages = resp.json().get("query", {}).get("pages", {}).values()
-        return [{"source": "Wikipedia", "title": p["title"], "text": p.get("extract", "")[:900],
+        return [{"source": "Wikipedia", "title": p["title"], "text": p.get("extract", "")[:1500],
                  "url": "https://en.wikipedia.org/wiki/" + p["title"].replace(" ", "_")}
                 for p in pages if p.get("extract")]
     except Exception as e:
@@ -84,7 +85,7 @@ def tavily_call(q, key, domains):
     resp = requests.post("https://api.tavily.com/search", json=body,
                          headers={"Authorization": "Bearer " + key}, timeout=25)
     resp.raise_for_status()
-    return [{"source": domain_of(x["url"]), "title": x["title"], "text": x["content"][:900], "url": x["url"]}
+    return [{"source": domain_of(x["url"]), "title": x["title"], "text": x["content"][:1500], "url": x["url"]}
             for x in resp.json().get("results", []) if x.get("content")]
 
 
@@ -110,16 +111,29 @@ def web_search_ddg(q):
             if len(rows) < 2:
                 rows += list(d.text(q, region="ca-en", max_results=5))
         return [{"source": domain_of(r.get("href", "")), "title": r.get("title", ""),
-                 "text": (r.get("body") or "")[:900], "url": r.get("href", "")}
+                 "text": (r.get("body") or "")[:1500], "url": r.get("href", "")}
                 for r in rows if r.get("href") and r.get("body")]
     except Exception as e:
         ERRORS.append(f"Web search ({type(e).__name__})")
         return []
 
 
-def cited_numbers(text):
-    """Find source tags like [3] or [1, 4] in the report."""
-    nums, i = set(), 0
+def norm(s):
+    """Lowercase letters and digits only, single spaces. Makes quote matching ignore punctuation."""
+    return " ".join("".join(ch.lower() if ch.isalnum() else " " for ch in s).split())
+
+
+def quote_in_source(quote, text):
+    """True if the quote really appears in the source text. '...' gaps are allowed between fragments."""
+    nt = norm(text)
+    frags = [norm(f) for f in quote.replace(chr(8230), "...").split("...")]
+    frags = [f for f in frags if len(f.split()) >= 3]
+    return bool(frags) and all(f in nt for f in frags)
+
+
+def cited_ids(text):
+    """Evidence tags like [E3] or [E3, E5] found in text."""
+    ids, i = set(), 0
     while True:
         i = text.find("[", i)
         if i < 0:
@@ -128,10 +142,101 @@ def cited_numbers(text):
         if j < 0:
             break
         for part in text[i + 1:j].split(","):
-            if part.strip().isdigit():
-                nums.add(int(part.strip()))
+            p = part.strip()
+            if p[:1] in ("E", "e") and p[1:].isdigit():
+                ids.add(int(p[1:]))
         i = j + 1
-    return nums
+    return ids
+
+
+def numbers_in(text):
+    """Numbers in text, ignoring anything inside [brackets]. Commas removed: 1,053 -> 1053."""
+    clean, depth = [], 0
+    for ch in text:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            clean.append(ch)
+    return [n.replace(",", "") for n in re.findall(r"[0-9]+(?:[,.][0-9]+)*", "".join(clean))]
+
+
+def fact_check(final, ledger):
+    """Check every number in the one-pager against the evidence quotes. Returns table rows."""
+    by_id = {e["id"]: e for e in ledger}
+    rows = []
+    for line in final.split(NL):
+        nums = numbers_in(line)
+        if not nums:
+            continue
+        tags = cited_ids(line)
+        for n in nums:
+            in_cited = [i for i in sorted(tags) if i in by_id and n in numbers_in(by_id[i]["quote"])]
+            elsewhere = [e["id"] for e in ledger if e["id"] not in tags and n in numbers_in(e["quote"])]
+            if in_cited:
+                status = "Supported by " + ", ".join("E" + str(i) for i in in_cited)
+            elif elsewhere:
+                status = "In " + ", ".join("E" + str(i) for i in elsewhere[:3]) + " but not cited on this line"
+            else:
+                status = "NOT FOUND in evidence"
+            rows.append({"Number": n, "Status": status, "Line": line.strip()[:140]})
+        for t in sorted(tags):
+            if t not in by_id:
+                rows.append({"Number": "E" + str(t), "Status": "NOT FOUND in evidence (unknown tag)", "Line": line.strip()[:140]})
+    return rows
+
+
+def extract_evidence(client, topic, angle, notes):
+    """Analysis stage: pull quotes, links and insights from the sources, then verify each quote."""
+    ledger, batch_size = [], 5
+    for start in range(0, len(notes), batch_size):
+        batch = notes[start:start + batch_size]
+        block = (NL * 2).join(f"Source {start + k}: {n['title']} ({n['source']})" + NL + n["text"]
+                              for k, n in enumerate(batch, 1))
+        prompt = f"""Topic: {topic}
+Question the POV must answer: {angle}
+
+Below are numbered sources. For each source, extract up to 3 evidence items that help answer the question.
+Prefer concrete data: percentages, counts, dollar amounts, dates, survey results, named findings.
+Each item has these keys:
+"source_id": the source number
+"quote": a sentence or fragment copied word for word from that source text, at most 40 words.
+Do not paraphrase or fix wording inside the quote.
+"insight": one sentence on what this evidence means for the question
+"kind": "data" if the quote contains a number or a measured result, otherwise "context"
+Skip a source that has nothing relevant. Reply with a JSON list only.
+
+Sources:
+{block}"""
+        items = None
+        for attempt in range(2):
+            raw = llm(client, "You are a data analyst who extracts verifiable evidence. Reply with a JSON list only.",
+                      prompt, 2500)
+            try:
+                items = json.loads(raw[raw.find("["):raw.rfind("]") + 1])
+                break
+            except Exception:
+                items = None
+        if items is None:
+            ERRORS.append(f"Analysis batch {start // batch_size + 1} (bad JSON)")
+            continue
+        per_source = {}
+        for it in items:
+            try:
+                sid, quote = int(it["source_id"]), str(it["quote"]).strip()
+            except Exception:
+                continue
+            if not (start < sid <= start + len(batch)) or not quote or per_source.get(sid, 0) >= 3:
+                continue
+            per_source[sid] = per_source.get(sid, 0) + 1
+            n = notes[sid - 1]
+            ledger.append({"id": len(ledger) + 1, "source_id": sid, "quote": quote,
+                           "insight": str(it.get("insight", "")).strip(),
+                           "kind": "data" if str(it.get("kind", "")).lower() == "data" else "context",
+                           "verified": quote_in_source(quote, n["text"]),
+                           "source": n["source"], "title": n["title"], "url": n["url"]})
+    return ledger[:36]
 
 
 # ---------- Sidebar ----------
@@ -179,7 +284,7 @@ Keep any place named in the topic inside every query.""")
                                     topic + " statistics report"]}
             plan["queries"] = plan["queries"][:4]
             s.update(label="Planning Agent: done", state="complete")
-        prog.progress(20, "Researching...")
+        prog.progress(15, "Researching...")
 
         with st.status("Research Agent: searching trusted sources...", expanded=False) as s:
             found = []
@@ -195,60 +300,75 @@ Keep any place named in the topic inside every query.""")
             s.update(label=f"Research Agent: {len(notes)} sources gathered", state="complete")
         if not notes:
             raise RuntimeError("No sources were found. Add a free Tavily key in the sidebar and run again.")
-        prog.progress(45, "Writing...")
-        ctx = (NL * 2).join(f"[{i}] {n['title']} ({n['source']}): {n['text']}" for i, n in enumerate(notes, 1))
+        prog.progress(35, "Analysing...")
 
-        with st.status("Writer: drafting the one-pager...", expanded=False) as s:
+        with st.status("Analysis Agent: extracting quotes, links and insights...", expanded=False) as s:
+            ledger = extract_evidence(client, topic, plan["angle"], notes)
+            good = [e for e in ledger if e["verified"]]
+            s.update(label=f"Analysis Agent: {len(good)} of {len(ledger)} quotes verified in their sources",
+                     state="complete")
+        if len(good) < 3:
+            raise RuntimeError("Fewer than 3 quotes could be verified against their sources. "
+                               "Run again, add a Tavily key, or try another :free model.")
+        prog.progress(60, "Writing...")
+        facts = NL.join(f"[E{e['id']}] {Q}{e['quote']}{Q} ({e['source']}) | Insight: {e['insight']}" for e in good)
+
+        with st.status("Writer: drafting the one-pager from the evidence...", expanded=False) as s:
             draft = llm(client, "You write one-page point-of-view briefs for marketing and strategy leaders. "
                                 "Plain, confident and specific.",
                         f"""Topic: {topic}
 Question to answer: {plan['angle']}
 
-Sources (cite them as [n]):
-{ctx}
+Evidence ledger. Every fact you use must come from here and carry its tag, like [E4]:
+{facts}
 
 Write a one-page POV of 350 to 450 words in markdown with exactly these parts:
 ## The POV
 2 to 3 sentences that take a clear position, not a summary.
 ## What the evidence says
-4 to 6 bullets. Each bullet holds one specific fact or number and ends with its source tag, like [2].
+4 to 6 bullets. Each bullet holds one specific fact or number and ends with its evidence tag.
 ## Why it matters
-3 bullets on what this means for brands, marketers or decision makers.
+3 bullets on what this means for brands, marketers or decision makers. Tag any fact you rely on.
 ## Watch-outs
 2 bullets on gaps, risks or things to verify.
 
-Rules: use only facts that appear in the sources. Never invent numbers, dates or quotes.
-If the sources lack data on something, say so under Watch-outs. Do not write a sources list.""", 2500)
+Rules: use only facts that appear in the ledger. Never invent numbers, dates or quotes.
+Copy numbers exactly as written in the quote. If the ledger lacks data on something, say so
+under Watch-outs. Do not write a sources list.""", 2500)
             s.update(label="Writer: draft complete", state="complete")
-        prog.progress(70, "Editing...")
+        prog.progress(78, "Editing...")
 
-        with st.status("Editor Agent: reviewing...", expanded=False) as s:
+        with st.status("Editor Agent: reviewing against the evidence...", expanded=False) as s:
             feedback = llm(client, "You are a critical editor of strategy briefs. Give 4-5 specific, actionable "
                                    "suggestions as a bullet list.",
-                           f"""Review this one-pager against its sources.
-Check: is every number or claim supported by a source, is the POV a clear position, is the
-'so what' useful to a marketer, and is it under 450 words.
+                           f"""Review this one-pager against its evidence ledger.
+Check: is every number or claim supported by the evidence item it cites, is the POV a clear
+position, is the 'so what' useful to a marketer, and is it under 450 words.
 
 One-pager:
 {draft}
 
-Sources:
-{ctx}""")
+Evidence ledger:
+{facts}""")
             s.update(label="Editor Agent: feedback ready", state="complete")
 
         with st.status("Revising with feedback...", expanded=False) as s:
             final = llm(client, "Revise the one-pager applying every suggestion. Output markdown only.",
-                        f"""Keep the same four parts, keep it between 350 and 450 words, keep the [n] source tags,
-and remove any claim the sources do not support. Do not add a sources list.
+                        f"""Keep the same four parts, keep it between 350 and 450 words, keep the evidence tags like [E4],
+copy numbers exactly as written in the ledger, and remove any claim the ledger does not support.
+Do not add a sources list.
 
 One-pager:
 {draft}
 
 Suggestions:
-{feedback}""", 2500)
+{feedback}
+
+Evidence ledger:
+{facts}""", 2500)
             s.update(label="Revision complete", state="complete")
         prog.progress(100, "Done")
-        S.result = dict(errors=sorted(set(ERRORS)), plan=plan, notes=notes, draft=draft,
+        S.result = dict(errors=sorted(set(ERRORS)), plan=plan, notes=notes, ledger=ledger, draft=draft,
                         feedback=feedback, final=final, secs=round(time.time() - t0, 1))
     except AuthenticationError:
         st.error("The API key was rejected (401). Create a new key at openrouter.ai/keys and paste the whole key with no spaces.")
@@ -261,18 +381,28 @@ Suggestions:
 
 if "result" in st.session_state:
     R = st.session_state.result
-    used = sorted(n for n in cited_numbers(R["final"]) if 1 <= n <= len(R["notes"]))
-    sources_md = NL.join(f"{n}. [{R['notes'][n - 1]['title']}]({R['notes'][n - 1]['url']}) - {R['notes'][n - 1]['source']}"
-                         for n in (used or range(1, len(R["notes"]) + 1)))
-    full = R["final"] + NL * 2 + "### Sources" + NL + sources_md
+    ledger = R["ledger"]
+    by_id = {e["id"]: e for e in ledger}
+    checks = fact_check(R["final"], [e for e in ledger if e["verified"]])
+    bad = [c for c in checks if c["Status"].startswith("NOT FOUND")]
+    used = sorted(i for i in cited_ids(R["final"]) if i in by_id)
+    sources_md = NL.join(f"- **E{i}** [{by_id[i]['title']}]({by_id[i]['url']}) ({by_id[i]['source']}): {Q}{by_id[i]['quote']}{Q}"
+                         for i in used)
+    full = R["final"] + NL * 2 + "### Evidence behind this page" + NL + (sources_md or "No evidence tags found.")
+
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow(["id", "verified", "kind", "source", "title", "url", "quote", "insight"])
+    for e in ledger:
+        wr.writerow([f"E{e['id']}", e["verified"], e["kind"], e["source"], e["title"], e["url"], e["quote"], e["insight"]])
 
     c = st.columns(4)
     c[0].metric("Sources gathered", len(R["notes"]))
-    c[1].metric("Sources cited", len(used))
-    c[2].metric("One-pager words", len(R["final"].split()))
+    c[1].metric("Evidence verified", f"{sum(1 for e in ledger if e['verified'])} of {len(ledger)}")
+    c[2].metric("Numbers not in evidence", len(bad))
     c[3].metric("Runtime (s)", R["secs"])
 
-    t = st.tabs(["Plan", "Research", "Draft", "Editor", "One-pager"])
+    t = st.tabs(["Plan", "Research", "Analysis", "Draft", "Editor", "One-pager", "Fact-check"])
     with t[0]:
         st.markdown('<div class="agent a1">Planning Agent</div>', unsafe_allow_html=True)
         st.write("**Question the POV answers**")
@@ -289,10 +419,26 @@ if "result" in st.session_state:
                 st.write(n["text"])
                 st.markdown(f"[Open source]({n['url']})")
     with t[2]:
-        st.markdown(R["draft"])
+        st.markdown('<div class="agent a1">Analysis Agent: evidence ledger</div>', unsafe_allow_html=True)
+        st.caption("Each quote was checked against its source text by code. Only verified quotes feed the one-pager.")
+        for e in ledger:
+            flag = "Verified in source" if e["verified"] else "NOT found word for word, excluded"
+            st.markdown(f"**E{e['id']}** | {e['kind']} | {flag} | {e['source']}")
+            st.markdown("> " + e["quote"])
+            st.markdown(f"Insight: {e['insight']}  " + NL + f"[Open source]({e['url']})")
+            st.divider()
+        st.download_button("Download evidence ledger (.csv)", buf.getvalue(), "evidence_ledger.csv")
     with t[3]:
+        st.markdown(R["draft"])
+    with t[4]:
         st.markdown('<div class="agent a3">Editor Agent</div>', unsafe_allow_html=True)
         st.markdown(R["feedback"])
-    with t[4]:
+    with t[5]:
         st.markdown(full)
         st.download_button("Download one-pager (.md)", full, "one_pager.md")
+    with t[6]:
+        st.caption("Every number in the one-pager is looked up in the verified evidence quotes.")
+        if checks:
+            st.dataframe(checks, hide_index=True)
+        else:
+            st.write("The one-pager contains no numbers to check.")
