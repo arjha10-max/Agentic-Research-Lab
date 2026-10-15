@@ -7,6 +7,8 @@ import json, os, re, time, xml.etree.ElementTree as ET
 import requests, streamlit as st
 from openai import OpenAI
 
+NL = chr(10)
+
 st.set_page_config(page_title="Agentic Research Lab", page_icon="🧠", layout="wide")
 st.markdown("""<style>
 .block-container{padding-top:2rem}
@@ -66,4 +68,58 @@ with st.sidebar:
     akey = st.text_input("API key", os.getenv("LLM_API_KEY", ""), type="password")
     tkey = st.text_input("Tavily API key (optional)", os.getenv("TAVILY_API_KEY", ""), type="password")
     st.markdown("---")
-    st.markdown("**Pipeline**\n1. 🗂 Planner\n2. 🔎 Researcher\n3. ✍️ Writer\n4. 🧐
+    st.markdown(NL.join(["**Pipeline**", "1. 🗂 Planner", "2. 🔎 Researcher", "3. ✍️ Writer", "4. 🧐 Editor", "5. ✅ Revision"]))
+
+st.title("🧠 Agentic Research Lab")
+st.caption("Planning → external tools (Arxiv, Tavily, Wikipedia) → writing → editorial feedback")
+topic = st.text_input("Research topic", "How do multi-agent LLM systems improve reasoning?")
+go = st.button("🚀 Run workflow", type="primary", disabled=not (akey and topic))
+
+if go:
+    client = OpenAI(api_key=akey, base_url=BASE_URL)
+    t0, S = time.time(), st.session_state
+    prog = st.progress(0, "Starting…")
+
+    with st.status("🗂 Planning Agent: building outline…", expanded=False) as s:
+        raw = llm(client, "You are a planning agent. Reply with JSON only.",
+                  f'Topic: {topic}{NL}Return {{"outline":[section titles x4],"queries":[3 short search queries]}}')
+        plan = json.loads(re.search(r"\{.*\}", raw, re.S).group())
+        s.update(label="🗂 Planning Agent: done", state="complete")
+    prog.progress(25, "Researching…")
+
+    with st.status("🔎 Research Agent: calling tools…", expanded=False) as s:
+        notes = []
+        for q in plan["queries"]:
+            notes += wikipedia(q) + arxiv(q) + tavily(q, tkey)
+        s.update(label=f"🔎 Research Agent: {len(notes)} sources gathered", state="complete")
+    prog.progress(50, "Writing…")
+    ctx = (NL * 2).join(f"[{n['source']}] {n['title']}: {n['text']}" for n in notes)
+
+    with st.status("✍️ Writer: drafting…", expanded=False) as s:
+        draft = llm(client, "You write concise, well-structured research reports in markdown. Cite sources by name.",
+                    f"Topic: {topic}{NL}Outline: {plan['outline']}{NL}{NL}Sources:{NL}{ctx}{NL}{NL}Write a ~500 word report.", 2500)
+        s.update(label="✍️ Writer: draft complete", state="complete")
+    prog.progress(75, "Editing…")
+
+    with st.status("🧐 Editor Agent: reflecting…", expanded=False) as s:
+        feedback = llm(client, "You are a critical editor. Give 4-5 specific, actionable suggestions as a bullet list.",
+                       f"Review this report:{NL}{NL}{draft}")
+        s.update(label="🧐 Editor Agent: feedback ready", state="complete")
+
+    with st.status("✅ Revising with feedback…", expanded=False) as s:
+        final = llm(client, "Revise the report applying every suggestion. Output markdown only.",
+                    f"Report:{NL}{draft}{NL}{NL}Suggestions:{NL}{feedback}", 2500)
+        s.update(label="✅ Revision complete", state="complete")
+    prog.progress(100, "Done")
+    S.result = dict(plan=plan, notes=notes, draft=draft, feedback=feedback, final=final,
+                    secs=round(time.time() - t0, 1))
+
+if "result" in st.session_state:
+    R = st.session_state.result
+    c = st.columns(4)
+    c[0].metric("Sections planned", len(R["plan"]["outline"]))
+    c[1].metric("Sources gathered", len(R["notes"]))
+    c[2].metric("Final words", len(R["final"].split()))
+    c[3].metric("Runtime (s)", R["secs"])
+
+    t = st.tabs(["🗂
